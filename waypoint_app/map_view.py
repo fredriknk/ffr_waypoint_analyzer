@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, Q
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
 
 from .geo import HALF_WORLD, WORLD, Projection, TileSet
-from .geometry import centre, chambers, measurement_squares
+from .geometry import centre, chambers, measurement_footprints
 from .map_layout import glyphs, handle_distance, label_rects, segment_distance
 
 COLORS = {"Measure": "#62e7b5", "DriveThrough": "#69b7ff",
@@ -42,6 +42,7 @@ class MapView(QGraphicsView):
         self.show_headings = True
         self.show_squares = False
         self.square_size = None
+        self.rectangle_size = None
         self.allow_heading_edit = True
         self.allow_group_rotation = True
         self.add_mode = False
@@ -80,11 +81,11 @@ class MapView(QGraphicsView):
         self.viewport().update()
 
     def screen(self, x, y):
-        return QPointF(self.mapFromScene(QPointF(*self.projection.scene(x, y))))
+        return self.viewportTransform().map(QPointF(*self.projection.scene(x, y)))
 
     def heading_vector(self, point):
         origin = self.screen(point.x, point.y)
-        end = QPointF(self.mapFromScene(QPointF(*self.projection.heading(point))))
+        end = self.viewportTransform().map(QPointF(*self.projection.heading(point)))
         dx, dy = end.x() - origin.x(), end.y() - origin.y()
         length = math.hypot(dx, dy)
         if length < .1:
@@ -230,12 +231,24 @@ class MapView(QGraphicsView):
         transform = self.viewportTransform()
         key = (self.viewport().width(), self.viewport().height(), transform.m11(),
                transform.dx(), transform.dy(), id(self.projection),
-               tuple((id(p), p.uid, p.x, p.y, p.angle, p.name) for p in self.points))
+               tuple((id(p), p.uid, p.x, p.y, p.angle, p.name) for p in self.points),
+               frozenset(self.selected_uids), self.selected_uid)
         if key != self._layout_key:
+            # Use a fixed ground anchor, so panning cannot affect the zoom
+            # detail level through the projection's varying local scale.
+            a = (QPointF(*self.projection.scene(self.points[0].x, self.points[0].y)) if self.points
+                 else self.mapToScene(self.viewport().rect().center()))
+            b = a + QPointF(100 / transform.m11(), 0)
+            ax, ay = self.projection.coordinates(a.x(), a.y())
+            bx, by = self.projection.coordinates(b.x(), b.y())
+            pixels_per_metre = 100 / max(1e-9, math.hypot(bx - ax, by - ay))
+            # Compact overview, gradually revealing separate overlapping handles
+            # only when the ground scale is suitable for individual pose editing.
+            detail = max(0., min(1., (pixels_per_metre - 14) / 14))
             self._glyphs = glyphs(self.points, [self.screen(p.x, p.y) for p in self.points],
-                                  [self.heading_vector(p) for p in self.points])
+                                  [self.heading_vector(p) for p in self.points], detail)
             self._labels = label_rects(self._glyphs, QFontMetrics(self._label_font),
-                                      QRectF(self.viewport().rect()))
+                                      QRectF(self.viewport().rect()), self.selected_uids | {self.selected_uid})
             self._layout_key = key
 
     def _label_visible(self, point):
@@ -249,9 +262,10 @@ class MapView(QGraphicsView):
         positions = [item.position for item in self._glyphs]
         viewport = QRectF(self.viewport().rect()).adjusted(-120, -120, 120, 120)
         if self.show_squares:
-            key = (self.square_size, tuple((p.x, p.y, p.angle, p.kind, p.side) for p in self.points))
+            key = (self.square_size, self.rectangle_size,
+                   tuple((p.x, p.y, p.angle, p.kind, p.side) for p in self.points))
             if key != self._squares_key:
-                self._squares = measurement_squares(self.points, self.square_size)
+                self._squares = measurement_footprints(self.points, self.square_size, self.rectangle_size)
                 self._squares_key = key
             painter.setBrush(QColor(98, 231, 181, 16))
             painter.setPen(QPen(QColor(98, 231, 181, 210), 1.3, Qt.PenStyle.DashLine))
@@ -273,6 +287,15 @@ class MapView(QGraphicsView):
                 if length > 65:
                     mid = (a + b) / 2
                     self._arrow(painter, mid - delta / length * 5, mid + delta / length * 5, "#d2e8ef", 1)
+        # Chambers are a separate layer. Reusing the marker loop variable here
+        # previously replaced a Glyph with a Chamber and aborted the redraw.
+        if self.show_chambers:
+            painter.setPen(QPen(QColor(COLORS["Measure"]), 1))
+            painter.setBrush(QColor(98, 231, 181, 110))
+            for chamber in chambers(self.points):
+                position = self.screen(chamber.x, chamber.y)
+                if viewport.contains(position):
+                    painter.drawRect(QRectF(position.x() - 3, position.y() - 3, 6, 6))
         # Leader lines make displaced, collision-free tags unambiguous.
         for item in self._glyphs:
             box = self._labels.get(item.point.uid)
@@ -289,12 +312,6 @@ class MapView(QGraphicsView):
                 continue
             selected = point.uid in self.selected_uids or point.uid == self.selected_uid
             color = COLORS[point.kind]
-            if self.show_chambers and point.kind == "Measure":
-                for item in chambers([point]):
-                    chamber = self.screen(item.x, item.y)
-                    painter.setPen(QPen(QColor(color), 1))
-                    painter.setBrush(QColor(98, 231, 181, 110))
-                    painter.drawRect(QRectF(chamber.x() - 3, chamber.y() - 3, 6, 6))
             if selected:
                 painter.setPen(QPen(QColor("#ffffff"), 2))
                 painter.setBrush(QColor(255, 255, 255, 35))

@@ -3,9 +3,9 @@
 A native Python / Qt editor for robot waypoint routes, with offline satellite imagery.
 The original experimental reviewer remains available in `analyze_coords.py`.
 
-![Waypoint Studio showing the supplied route on local satellite imagery](docs/editor_preview.png)
+![Compact route overview on local satellite imagery](docs/overview_editor_preview.png)
 
-![Group editing and measurement squares](docs/group_editor_preview.png)
+![Close-up overlapping waypoints with right-side labels](docs/overlap_editor_preview.png)
 
 ## Run
 
@@ -40,11 +40,12 @@ python waypoint_editor.py Waypoints/Soil2Milk_hel.csv --crs EPSG:32632 --tiles s
   adds to the current selection. Ctrl+A while the map/list has focus selects the whole route.
   The list shows actual robot driving order. Search filters the list without changing the route
   or existing map selection.
-- **Overlapping waypoints:** earlier route entries have larger circles and longer arrows,
-  with later entries drawn on top at smaller sizes. Click an exposed ring or arrow to select
-  its waypoint, or click its name tag. Ctrl-click rings, arrows or tags to select both points.
-  Tags are spaced apart with leader lines linking them to their waypoints; in very crowded
-  views, zoom in to reveal any tags that cannot fit on screen.
+- **Overlapping waypoints:** the overview uses compact markers and hides crowded names.
+  Zooming in gradually reveals larger circles and longer arrows for earlier overlapping route
+  entries, with later entries drawn on top. Click an exposed ring, arrow, or name tag to select;
+  Ctrl-click selects multiple points. Names stay on the right, with short vertical stacks for
+  close overlapping points. Panning moves tags with their markers; it never relocates them to
+  free space elsewhere on the screen. Zoom in to reveal crowded or clipped tags.
 - **Move:** drag any selected waypoint with the **Move** tool to move the whole selection.
   A single waypoint also accepts X and Y in the inspector. With multiple points selected,
   **Transform selection** provides X/Y offsets and a rotation in degrees.
@@ -65,12 +66,25 @@ python waypoint_editor.py Waypoints/Soil2Milk_hel.csv --crs EPSG:32632 --tiles s
   autorotation is checked; group rotation can still rotate the positions and follow the new path.
 - **Change properties:** choose type or measurement side, or edit coordinates/Z/heading.
   Numeric edits apply on Enter or when you leave the field. Types are `Measure`,
-  `DriveThrough`, `TurningPoint`, and `Stop`.
+  `DriveThrough`, `TurningPoint`, and `Stop`. The mouse wheel scrolls the panel over an input
+  until you explicitly click that input. A clicked field accepts wheel edits while focused;
+  leaving the field restores panel scrolling. This also protects dropdowns from accidental changes.
 - **Add:** choose type, side, and **Append to end**, **Insert before selected**, or
   **Insert after selected**. Click **Place waypoint on map**, then click its location.
   For insertion, you can instead use **Insert at segment midpoint**. A new waypoint
-  inherits Z and heading from the selected waypoint; a midpoint uses the adjacent
-  points’ average Z and circular mean heading. Set the desired properties in the inspector.
+  inherits Z from the selected waypoint; a midpoint uses the adjacent points’ average Z.
+  **Every new waypoint is aligned to travel**, even with autorotation unchecked:
+  drive-throughs use incoming travel; measurements and turns use outgoing travel; new stops
+  use incoming travel. Endpoints use the available segment, skipping coincident positions.
+  If no distinct neighbour exists, the selected or midpoint heading is used as a fallback.
+  **DriveThrough + TurningPoint** creates two consecutive rows at the same clicked location,
+  each with its own path heading, name and type. Both are selected afterwards; creation and
+  renumbering are one undo step. The option also works with midpoint insertion.
+- **Creation shortcuts:** while the map or route list has focus, `Shift+D` selects DriveThrough,
+  `Shift+M` Measure, `Shift+T` TurningPoint, `Shift+S` Stop, and `Shift+B` the drive-through/turn
+  pair. The shortcut arms placement; click the map to create the point(s), or `Esc` to cancel.
+  Shortcuts keep the **Add a waypoint** side and route-position settings. They do not run while
+  typing in inspector/search fields. The **Add waypoint** menu exposes the same commands.
 - **Delete:** use the inspector’s Delete button or press Delete while the map/list has focus.
   All selected waypoints are removed together and their affected naming families are renumbered.
 - **Undo/redo:** `Ctrl+Z`, `Ctrl+Y`, or `Ctrl+Shift+Z`. A complete drag is one undo step.
@@ -133,13 +147,18 @@ map and cached; coarser images fill missing detailed tiles. No online map servic
 browser is required. Areas outside the download show a dark background and a message.
 
 Optional measurement chamber markers use the original geometry: 0.2 metres ahead
-of the robot and 2 metres to each active side. **Measurement squares** draws real ground-sized
-squares around those chambers, aligned with the field’s minimum-area bounding rectangle as
-in the original reviewer. Automatic side length is the nearest distinct chamber distance;
-coincident chambers are ignored for sizing. A lone chamber uses a 2-metre square. **Use a fixed
-square size** selects a custom side length in metres. Squares are a display overlay and do not
+of the robot and 2 metres to each active side. **Measurement footprints** draws real ground-sized
+squares or rectangles around those chambers, aligned with the field’s minimum-area bounding
+rectangle as in the original reviewer. Automatic square side length is the nearest distinct
+chamber distance; coincident chambers are ignored for sizing. A lone chamber uses a 2-metre
+square. **Use a fixed square size** selects a custom side length in metres. **Use a fixed rectangle**
+enables independent **Width** and **Height** inputs, initially 2 × 4 m; set them to any dimensions
+such as 1 × 3 m. Choosing either fixed shape turns on the footprint layer and switches off the
+other fixed shape. Uncheck both for automatic squares. Footprints are a display overlay and do not
 change CSV data. Map names use non-overlapping clickable tags and leader lines.
 Selected waypoints have white rings around their individual marker sizes.
+
+![Measurement chambers and fixed 2 × 4 m footprints](docs/rectangle_editor_preview.png)
 
 ## CSV format
 

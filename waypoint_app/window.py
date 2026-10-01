@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QItemSelectionModel, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QCheckBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QSplitter, QTableWidget, QTableWidgetItem,
     QToolBar, QVBoxLayout, QWidget, QAbstractItemView, QInputDialog,
@@ -19,8 +19,12 @@ from .geo import Projection, TileSet
 from .map_view import COLORS, MapView
 from .model import Document, SIDES, TYPES, Waypoint
 from .geometry import autorotate, centre, snap_chambers, snap_positions, transform
+from .widgets import ClickWheelComboBox as QComboBox, ClickWheelDoubleSpinBox as QDoubleSpinBox
 
 ROOT = Path(__file__).resolve().parent.parent
+COMBINED_TYPE = "DriveThrough + TurningPoint"
+CREATION_KEYS = (("D", "DriveThrough"), ("M", "Measure"), ("T", "TurningPoint"),
+                 ("S", "Stop"), ("B", COMBINED_TYPE))
 
 STYLE = """
 QMainWindow, QWidget { background: #111c24; color: #dce8ee; font: 10pt 'Segoe UI'; }
@@ -213,6 +217,12 @@ class MainWindow(QMainWindow):
             select_all.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             select_all.triggered.connect(self.select_all)
             widget.addAction(select_all)
+            for key, kind in CREATION_KEYS:
+                shortcut = QAction(widget)
+                shortcut.setShortcut(QKeySequence(f"Shift+{key}"))
+                shortcut.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                shortcut.triggered.connect(lambda checked=False, kind=kind: self.arm_creation(kind))
+                widget.addAction(shortcut)
         layout.addWidget(self.table, 1)
         layout.addWidget(muted("Ctrl-click: multiple points · Shift-click: range. Shift-drag the map or use Select to box-select. Double-click to focus."))
 
@@ -220,7 +230,7 @@ class MainWindow(QMainWindow):
         add_layout = QVBoxLayout(add)
         form = QFormLayout()
         self.add_type = QComboBox()
-        self.add_type.addItems(TYPES)
+        self.add_type.addItems((*TYPES, COMBINED_TYPE))
         self.add_side = QComboBox()
         self.add_side.addItems(SIDES)
         self.placement = QComboBox()
@@ -239,7 +249,7 @@ class MainWindow(QMainWindow):
         self.midpoint_button.setToolTip("Select a waypoint and insert before or after it. The new waypoint is placed halfway along that segment.")
         self.midpoint_button.clicked.connect(self.insert_midpoint)
         add_layout.addWidget(self.midpoint_button)
-        add_layout.addWidget(muted("New points inherit the selected Z and heading. Following names of the same type are renumbered automatically."))
+        add_layout.addWidget(muted("New points inherit Z and align with travel. The combined option adds DriveThrough then TurningPoint at one location. Shift+D / M / T / S / B arms placement on the map."))
         layout.addWidget(add)
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
@@ -326,7 +336,7 @@ class MainWindow(QMainWindow):
         self.type_field.activated.connect(self.apply_fields)
         self.side_field.activated.connect(self.apply_fields)
         detail.addWidget(self.fields_group)
-        detail.addWidget(muted("Values apply on Enter or when you leave a field. Heading: 0° = grid east, +90° = grid north. CSV headings remain in radians."))
+        detail.addWidget(muted("Click a field before using the wheel to change it; otherwise the inspector scrolls. Values apply on Enter or when you leave a field. Heading: 0° = grid east, +90° = grid north. CSV headings remain in radians."))
         self.gps_label = muted("")
         detail.addWidget(self.gps_label)
         buttons = QHBoxLayout()
@@ -374,7 +384,7 @@ class MainWindow(QMainWindow):
         for text, attribute, default in (("Route and travel direction", "show_route", True),
                                           ("Waypoint names", "show_labels", True),
                                           ("Heading arrows", "show_headings", True),
-                                          ("Measurement squares", "show_squares", False),
+                                          ("Measurement footprints", "show_squares", False),
                                           ("Measurement chambers", "show_chambers", False)):
             checkbox = QCheckBox(text)
             checkbox.setChecked(default)
@@ -395,7 +405,25 @@ class MainWindow(QMainWindow):
         self.square_size.setEnabled(False)
         layer_layout.addWidget(self.fixed_squares)
         layer_layout.addWidget(self.square_size)
-        layer_layout.addWidget(muted("Squares surround active measurement chambers, aligned to the field. Automatic size uses the nearest distinct chamber, as in the original reviewer."))
+        self.fixed_rectangles = QCheckBox("Use a fixed rectangle")
+        layer_layout.addWidget(self.fixed_rectangles)
+        rectangle_form = QFormLayout()
+        rectangle_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.rectangle_width = QDoubleSpinBox()
+        self.rectangle_height = QDoubleSpinBox()
+        for label, spin, value in (("Width", self.rectangle_width, 2),
+                                   ("Height", self.rectangle_height, 4)):
+            spin.setRange(.01, 100)
+            spin.setDecimals(2)
+            spin.setSingleStep(.1)
+            spin.setValue(value)
+            spin.setSuffix(" m")
+            spin.setEnabled(False)
+            spin.valueChanged.connect(self.square_size_changed)
+            rectangle_form.addRow(label, spin)
+        self.fixed_rectangles.toggled.connect(self.square_size_changed)
+        layer_layout.addLayout(rectangle_form)
+        layer_layout.addWidget(muted("Footprints surround active measurement chambers and align with the field. Use automatic squares, a fixed square, or a rectangle with independent width and height (for example 2 × 4 m or 1 × 3 m)."))
         layer_layout.addWidget(muted("Chambers use the original script’s geometry: 0.2 m ahead and 2 m to either side."))
         detail.addWidget(display)
         settings = QGroupBox("Map setup")
@@ -442,6 +470,10 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.fit_action)
         view_menu.addAction(self.focus_action)
+        add_menu = self.menuBar().addMenu("Add waypoint")
+        for key, kind in CREATION_KEYS:
+            action = add_menu.addAction(f"{kind} (Shift+{key})")
+            action.triggered.connect(lambda checked=False, kind=kind: self.arm_creation(kind))
 
     def _connect_map(self):
         self.map.selected.connect(self.select)
@@ -613,9 +645,19 @@ class MainWindow(QMainWindow):
         self.map.viewport().update()
 
     def square_size_changed(self, *_):
+        if self.sender() is self.fixed_squares and self.fixed_squares.isChecked():
+            self.fixed_rectangles.setChecked(False)
+        elif self.sender() is self.fixed_rectangles and self.fixed_rectangles.isChecked():
+            self.fixed_squares.setChecked(False)
         fixed = self.fixed_squares.isChecked()
+        rectangle = self.fixed_rectangles.isChecked()
         self.square_size.setEnabled(fixed)
+        self.rectangle_width.setEnabled(rectangle)
+        self.rectangle_height.setEnabled(rectangle)
         self.map.square_size = self.square_size.value() if fixed else None
+        self.map.rectangle_size = (self.rectangle_width.value(), self.rectangle_height.value()) if rectangle else None
+        if fixed or rectangle:
+            self.squares_checkbox.setChecked(True)
         self.map.viewport().update()
 
     def rotation_options_changed(self, *_):
@@ -781,7 +823,13 @@ class MainWindow(QMainWindow):
         self.map.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.OpenHandCursor)
         self.add_button.setText("Cancel placement (Esc)" if enabled else "Place waypoint on map")
         self.map.viewport().update()
-        self.statusBar().showMessage("Click the map to place the new waypoint. Esc cancels." if enabled else "Ready to review and edit.")
+        self.statusBar().showMessage(f"Click the map to place {self.add_type.currentText()} · {self.add_side.currentText()} · {self.placement.currentText()}. Esc cancels." if enabled else "Ready to review and edit.")
+
+    def arm_creation(self, kind):
+        self.cancel_mode()
+        self.add_type.setCurrentText(kind)
+        self.add_button.setChecked(True)
+        self.map.setFocus()
 
     def cancel_mode(self):
         if self.map._gesture:
@@ -801,26 +849,38 @@ class MainWindow(QMainWindow):
         return index + (1 if mode == 2 else 0)
 
     def add_at(self, x, y, angle=None, z=None):
+        before = self.doc.snapshot()
         try:
             index = self.insertion_index()
             self.projection.scene(x, y)
             selected = self.selected_point()
-            point = Waypoint(x, y, z if z is not None else selected.z if selected else 0,
-                             angle if angle is not None else selected.angle if selected else 0,
-                             self.add_type.currentText(), self.add_side.currentText(), "New")
-            before = self.doc.snapshot()
-            self.doc.insert(index, point)
+            kinds = (("DriveThrough", "TurningPoint") if self.add_type.currentText() == COMBINED_TYPE
+                     else (self.add_type.currentText(),))
+            created = []
+            for offset, kind in enumerate(kinds):
+                point = Waypoint(x, y, z if z is not None else selected.z if selected else 0,
+                                 angle if angle is not None else selected.angle if selected else 0,
+                                 kind, self.add_side.currentText(), "New")
+                self.doc.insert(index + offset, point)
+                created.append(point)
+            created_uids = {p.uid for p in created}
+            # New points always conform to the route, independently of the
+            # checkbox governing subsequent edits of existing waypoints.
+            autorotate(self.doc.points, created_uids, include_stops=True)
             if self.auto_rotation.isChecked():
-                autorotate(self.doc.points, {point.uid} | self.selected_uids)
-            self.doc.record("add waypoint", before)
+                autorotate(self.doc.points, self.selected_uids)
+            self.doc.record("add waypoint pair" if len(created) == 2 else "add waypoint", before)
         except (ValueError, RuntimeError) as error:
+            self.doc.points = before
+            self.refresh()
             self.error("Cannot add waypoint", error)
             return
-        self.selected_uid = point.uid
-        self.selected_uids = {point.uid}
+        self.selected_uid = created[-1].uid
+        self.selected_uids = created_uids
         self.add_button.setChecked(False)
         self.refresh()
-        self.statusBar().showMessage(f"Added {point.name} at route position {index + 1}. Drag it or edit its properties.", 8000)
+        names = " + ".join(p.name for p in created)
+        self.statusBar().showMessage(f"Added {names} at route position {index + 1}, with headings aligned to travel. Drag or edit the selection.", 8000)
 
     def insert_midpoint(self):
         index = self.doc.index(self.selected_uid)

@@ -55,13 +55,19 @@ def transform(points, uids, dx=0., dy=0., angle=0., pivot=None, baseline=None):
                 point.angle = heading + angle
 
 
-def autorotate(points, uids):
-    """Use incoming travel for DriveThrough, outgoing travel for plots/turns."""
+def autorotate(points, uids, include_stops=False):
+    """Incoming travel for DriveThrough, outgoing for plots/turns.
+
+    Creation can also align a new Stop with its incoming travel direction.
+    Subsequent automatic edits preserve manually configured Stop headings.
+    """
     changed = 0
     for index, point in enumerate(points):
-        if point.uid not in uids or point.kind not in ("DriveThrough", "Measure", "TurningPoint"):
+        if point.uid not in uids or point.kind not in ("DriveThrough", "Measure", "TurningPoint", "Stop"):
             continue
-        incoming = point.kind == "DriveThrough"
+        if point.kind == "Stop" and not include_stops:
+            continue
+        incoming = point.kind in ("DriveThrough", "Stop")
         preferred = range(index - 1, -1, -1) if incoming else range(index + 1, len(points))
         fallback = range(index + 1, len(points)) if incoming else range(index - 1, -1, -1)
         for sequence in (preferred, fallback):
@@ -208,21 +214,38 @@ def field_angle(coords):
     return best[1]
 
 
-def measurement_squares(points, fixed_size=None):
-    """Squares around active chambers, in metres, not screen marker boxes."""
+def measurement_footprints(points, fixed_size=None, rectangle_size=None):
+    """Field-aligned squares or rectangles around active chambers, in metres."""
     if fixed_size is not None and (not math.isfinite(fixed_size) or fixed_size <= 0):
         raise ValueError("Square size must be positive.")
+    if rectangle_size is not None:
+        if fixed_size is not None:
+            raise ValueError("Choose either a fixed square or a fixed rectangle.")
+        width, height = rectangle_size
+        if not all(math.isfinite(value) and value > 0 for value in (width, height)):
+            raise ValueError("Rectangle width and height must be positive.")
     items = chambers(points)
     coords = [(ch.x, ch.y) for ch in items]
     angle = field_angle(coords)
     c, s = math.cos(angle), math.sin(angle)
     result = []
     for index, chamber in enumerate(items):
-        distances = [math.hypot(chamber.x - other.x, chamber.y - other.y)
-                     for j, other in enumerate(items) if j != index]
-        distances = [d for d in distances if d > EPSILON]
-        half = fixed_size / 2 if fixed_size is not None else min(distances) / 2 if distances else 1.
+        if rectangle_size is not None:
+            half_width, half_height = width / 2, height / 2
+        elif fixed_size is not None:
+            half_width = half_height = fixed_size / 2
+        else:
+            distances = [math.hypot(chamber.x - other.x, chamber.y - other.y)
+                         for j, other in enumerate(items) if j != index]
+            distances = [d for d in distances if d > EPSILON]
+            half_width = half_height = min(distances) / 2 if distances else 1.
         corners = [(chamber.x + dx * c - dy * s, chamber.y + dx * s + dy * c)
-                   for dx, dy in ((-half, -half), (half, -half), (half, half), (-half, half))]
+                   for dx, dy in ((-half_width, -half_height), (half_width, -half_height),
+                                  (half_width, half_height), (-half_width, half_height))]
         result.append((chamber, corners))
     return result
+
+
+def measurement_squares(points, fixed_size=None):
+    """Keep the square geometry API used by the original footprint overlay."""
+    return measurement_footprints(points, fixed_size=fixed_size)

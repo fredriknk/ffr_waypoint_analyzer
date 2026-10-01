@@ -16,29 +16,31 @@ class Glyph:
     arrow_end: QPointF
     arrow_width: float
     head_size: float
+    cluster: int
 
 
-def glyphs(points, positions, vectors):
+def glyphs(points, positions, vectors, detail=1.):
     # Complete-link screen clusters avoid joining an entire row through a chain
     # of close neighbours. Sizes depend on route order, never selection order.
     groups = []
     for index, position in enumerate(positions):
         for group in groups:
-            if all(math.hypot(position.x() - positions[j].x(), position.y() - positions[j].y()) <= 12 for j in group):
+            if detail > 0 and all(math.hypot(position.x() - positions[j].x(), position.y() - positions[j].y()) <= 12 for j in group):
                 group.append(index)
                 break
         else:
             groups.append([index])
     result = [None] * len(points)
-    for group in groups:
+    for cluster, group in enumerate(groups):
         count = len(group)
         for rank, index in enumerate(group):
             layer = count - rank - 1
-            radius = 6.5 + layer * min(6., 42. / max(1, count - 1))
-            length = 26 + layer * min(12., 84. / max(1, count - 1))
+            radius = 5.5 + detail * (1 + layer * min(3.5, 10.5 / max(1, count - 1)))
+            length = 18 + detail * (8 + layer * min(8., 24. / max(1, count - 1)))
             result[index] = Glyph(points[index], index, positions[index], radius,
                                   positions[index] + vectors[index] * length,
-                                  2 + min(2, layer * .4), 7 + min(5, layer * 1.5))
+                                  2 + detail * min(1, layer * .2), 6 + detail * (1 + min(1.5, layer * .5)),
+                                  cluster)
     return result
 
 
@@ -67,58 +69,50 @@ def handle_distance(items, position):
     return max(43., max(lengths, default=26.) + 17)
 
 
-def label_rects(items, metrics, viewport):
-    """Place tags near their markers, then use free screen space if necessary.
+def label_rects(items, metrics, viewport, preferred=()):
+    """Right-side anchors determined by the route, independently of viewport edges.
 
-    Every returned rectangle is fully visible and disjoint from other tags,
-    marker/arrow bounds and the map HUD. Crowded views omit tags that cannot fit
-    instead of covering another tag; zooming exposes more space.
+    Pan translates tags with their points. Crowding hides tags instead of moving
+    them around the map; close overlapping clusters have a short vertical stack.
+    Selected tags take visibility priority. All collision decisions include the
+    entire route, so entering/leaving the viewport cannot rearrange other tags.
     """
-    available = viewport.adjusted(5, 5, -5, -5)
-    index = RectIndex()
-    index.add(QRectF(12, 12, 177, 33))
-    index.add(QRectF(12, viewport.height() - 53, 134, 48))
-    visible = []
+    markers = RectIndex()
+    groups = {}
     for item in items:
         p, r = item.position, item.radius
-        if not viewport.contains(p):
-            continue
-        visible.append(item)
-        index.add(QRectF(p.x() - r - 4, p.y() - r - 4, (r + 4) * 2, (r + 4) * 2))
+        groups.setdefault(item.cluster, []).append(item)
+        markers.add(QRectF(p.x() - r - 3, p.y() - r - 3, (r + 3) * 2, (r + 3) * 2))
         arrow = QRectF(p, item.arrow_end).normalized().adjusted(-item.head_size, -item.head_size,
                                                                 item.head_size, item.head_size)
-        index.add(arrow)
-        vector = item.arrow_end - p
-        length = math.hypot(vector.x(), vector.y())
-        handle = p + vector / length * handle_distance(items, p) if length else p
-        index.add(QRectF(handle.x() - 11, handle.y() - 11, 22, 22))
-    result = {}
+        markers.add(arrow)
     height = max(22, metrics.height() + 7)
-    for item in visible:
-        text = f"{item.index + 1} · {item.point.name}"
-        width = metrics.horizontalAdvance(text) + 14
-        p, r = item.position, item.radius
-        def candidates():
-            for band in range(7):
-                gap = r + 10 + band * 24
-                for shift in (0, -1, 1, -2, 2, -3, 3, -4, 4):
-                    y = p.y() - height / 2 + shift * (height + 5)
-                    yield QRectF(p.x() + gap, y, width, height)
-                    yield QRectF(p.x() - gap - width, y, width, height)
-                yield QRectF(p.x() - width / 2, p.y() - gap - height, width, height)
-                yield QRectF(p.x() - width / 2, p.y() + gap, width, height)
-        box = next((candidate for candidate in candidates()
-                    if available.contains(candidate) and not index.intersects(candidate.adjusted(-2, -2, 2, 2))), None)
+    anchors = {}
+    for group in groups.values():
+        x = max(max(item.position.x() + item.radius + 9,
+                    item.arrow_end.x() + item.head_size + 9) for item in group)
+        cy = sum(item.position.y() for item in group) / len(group)
+        for rank, item in enumerate(group):
+            text = f"{item.index + 1} · {item.point.name}"
+            y = cy + (rank - (len(group) - 1) / 2) * (height + 4) - height / 2
+            anchors[item.point.uid] = QRectF(x, y, metrics.horizontalAdvance(text) + 14, height)
+    occupied = RectIndex()
+    result = {}
+    available = viewport.adjusted(5, 5, -5, -5)
+    hud = (QRectF(12, 12, 177, 33), QRectF(12, viewport.height() - 53, 134, 48))
+    for item in sorted(items, key=lambda item: (item.point.uid not in preferred, item.index)):
+        box = anchors[item.point.uid]
+        # Selected points can use a modest extra right offset if another marker
+        # covers their normal tag. Never move a tag left or seek distant slots.
+        shifts = (0, 20, 40, 60) if item.point.uid in preferred else (0,)
+        box = next((box.translated(shift, 0) for shift in shifts
+                    if not markers.intersects(box.translated(shift, 0).adjusted(-2, -2, 2, 2))
+                    and not occupied.intersects(box.translated(shift, 0).adjusted(-2, -2, 2, 2))), None)
         if box is None:
-            # A finite grid fallback keeps arbitrarily crowded views bounded.
-            slots = [QRectF(x, y, width, height)
-                     for y in range(6, max(6, int(viewport.height() - height - 5)), height + 5)
-                     for x in range(6, max(6, int(viewport.width() - width - 5)), 20)]
-            slots.sort(key=lambda candidate: math.hypot(candidate.center().x() - p.x(), candidate.center().y() - p.y()))
-            box = next((candidate for candidate in slots if not index.intersects(candidate.adjusted(-2, -2, 2, 2))), None)
-        if box is not None:
+            continue
+        occupied.add(box.adjusted(-2, -2, 2, 2))
+        if available.contains(box) and not any(box.intersects(area) for area in hud):
             result[item.point.uid] = box
-            index.add(box.adjusted(-2, -2, 2, 2))
     return result
 
 
