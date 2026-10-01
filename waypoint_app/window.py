@@ -280,6 +280,9 @@ class MainWindow(QMainWindow):
         align_button = QPushButton("Align selected headings now")
         align_button.clicked.connect(self.align_selected)
         detail.addWidget(align_button)
+        self.align_after_move = QCheckBox("Autoalign headings after moving")
+        self.align_after_move.setToolTip("Run Align selected headings now when a move finishes. Applies to all selected waypoints; uses the same route heading rules.")
+        detail.addWidget(self.align_after_move)
 
         self.group_fields = QGroupBox("Transform selection")
         group_layout = QVBoxLayout(self.group_fields)
@@ -797,6 +800,10 @@ class MainWindow(QMainWindow):
 
     def end_gesture(self):
         if self._gesture_before is not None:
+            if self.align_after_move.isChecked():
+                original_positions = {p.uid: (p.x, p.y) for p in self._gesture_before}
+                if any((p.x, p.y) != original_positions.get(p.uid) for p in self.selected_points()):
+                    autorotate(self.doc.points, self.selected_uids)
             self.doc.record("drag waypoint", self._gesture_before)
             self._gesture_before = None
             self.refresh()

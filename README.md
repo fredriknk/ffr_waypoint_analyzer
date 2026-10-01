@@ -64,6 +64,9 @@ python waypoint_editor.py Waypoints/Soil2Milk_hel.csv --crs EPSG:32632 --tiles s
   **Align selected headings now** applies the rule once to any selection, even when the checkbox
   is off. Unselected headings are preserved. Manual single-point rotation is disabled while
   autorotation is checked; group rotation can still rotate the positions and follow the new path.
+  **Autoalign headings after moving**, directly below the alignment button, applies the same
+  rules to all selected waypoints when you release a drag that moved their positions. Enabling
+  it alone does not edit headings. Movement and final alignment form one undo step.
 - **Change properties:** choose type or measurement side, or edit coordinates/Z/heading.
   Numeric edits apply on Enter or when you leave the field. Types are `Measure`,
   `DriveThrough`, `TurningPoint`, and `Stop`. The mouse wheel scrolls the panel over an input
