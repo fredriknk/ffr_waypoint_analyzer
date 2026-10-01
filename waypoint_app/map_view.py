@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from types import SimpleNamespace
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
 
 from .geo import HALF_WORLD, WORLD, Projection, TileSet
+from .geometry import centre, chambers, measurement_squares
+from .map_layout import glyphs, handle_distance, label_rects, segment_distance
 
 COLORS = {"Measure": "#62e7b5", "DriveThrough": "#69b7ff",
           "TurningPoint": "#ffbd69", "Stop": "#ff7e99"}
@@ -16,6 +19,8 @@ COLORS = {"Measure": "#62e7b5", "DriveThrough": "#69b7ff",
 
 class MapView(QGraphicsView):
     selected = Signal(str)
+    selection_requested = Signal(str, str)
+    box_selected = Signal(list, bool)
     add_requested = Signal(float, float)
     gesture_started = Signal(str)
     moved = Signal(str, float, float)
@@ -30,14 +35,26 @@ class MapView(QGraphicsView):
         self.tiles = tiles
         self.points = []
         self.selected_uid = None
+        self.selected_uids = set()
         self.show_labels = True
         self.show_route = True
         self.show_chambers = False
         self.show_headings = True
+        self.show_squares = False
+        self.square_size = None
+        self.allow_heading_edit = True
+        self.allow_group_rotation = True
         self.add_mode = False
         self.edit_mode = "move"
         self._gesture = None
         self._pan = None
+        self._rubber = None
+        self._squares_key = None
+        self._squares = []
+        self._layout_key = None
+        self._glyphs = []
+        self._labels = {}
+        self._label_font = QFont("Segoe UI", 9)
         self._tile_cache = OrderedDict()
         self._location_cache = OrderedDict()
         self._drawn_tiles = 0
@@ -79,7 +96,45 @@ class MapView(QGraphicsView):
         return QPointF(dx / length, dy / length) if length else QPointF(1, 0)
 
     def handle(self, point):
-        return self.screen(point.x, point.y) + self.heading_vector(point) * 43
+        self._ensure_layout()
+        pivot = self.rotation_point(point)
+        origin, vector = self.screen(pivot.x, pivot.y), self.heading_vector(pivot)
+        distance = handle_distance(self._glyphs, origin)
+        # A group's centre may lie between its members' labels. Keep its
+        # rotation control clear of every visible tag as well as stacked arrows.
+        for _ in range(20):
+            position = origin + vector * distance
+            bounds = QRectF(position.x() - 11, position.y() - 11, 22, 22)
+            if not any(bounds.intersects(box) for uid, box in self._labels.items()
+                       if self.show_labels or uid in self.selected_uids or uid == self.selected_uid):
+                return position
+            distance += 22
+        return origin + vector * distance
+
+    def selected_points(self):
+        return [p for p in self.points if p.uid in self.selected_uids or p.uid == self.selected_uid]
+
+    def rotation_point(self, primary):
+        selected = self.selected_points()
+        if len(selected) > 1:
+            x, y = centre(selected)
+            return SimpleNamespace(x=x, y=y, angle=primary.angle)
+        return primary
+
+    def can_rotate(self):
+        return self.allow_heading_edit or (self.allow_group_rotation and len(self.selected_points()) > 1)
+
+    def fit_selection(self):
+        selected = self.selected_points()
+        if len(selected) == 1:
+            self.focus_waypoint(selected[0])
+        elif selected:
+            coords = [self.projection.scene(p.x, p.y) for p in selected]
+            xs, ys = zip(*coords)
+            margin = max(8, max(max(xs) - min(xs), max(ys) - min(ys)) * .15)
+            self.fitInView(QRectF(min(xs) - margin, min(ys) - margin,
+                                 max(xs) - min(xs) + margin * 2, max(ys) - min(ys) + margin * 2),
+                           Qt.AspectRatioMode.KeepAspectRatio)
 
     def fit_route(self):
         if not self.points:
@@ -158,7 +213,7 @@ class MapView(QGraphicsView):
                     self._drawn_tiles += 1
 
     @staticmethod
-    def _arrow(painter, start, end, color, width=2):
+    def _arrow(painter, start, end, color, width=2, head_size=7):
         painter.setPen(QPen(QColor(color), width))
         painter.drawLine(start, end)
         d = end - start
@@ -168,20 +223,41 @@ class MapView(QGraphicsView):
         d /= length
         normal = QPointF(-d.y(), d.x())
         painter.setBrush(QColor(color))
-        painter.drawPolygon(QPolygonF([end, end - d * 7 + normal * 3.5, end - d * 7 - normal * 3.5]))
+        painter.drawPolygon(QPolygonF([end, end - d * head_size + normal * head_size / 2,
+                                      end - d * head_size - normal * head_size / 2]))
+
+    def _ensure_layout(self):
+        transform = self.viewportTransform()
+        key = (self.viewport().width(), self.viewport().height(), transform.m11(),
+               transform.dx(), transform.dy(), id(self.projection),
+               tuple((id(p), p.uid, p.x, p.y, p.angle, p.name) for p in self.points))
+        if key != self._layout_key:
+            self._glyphs = glyphs(self.points, [self.screen(p.x, p.y) for p in self.points],
+                                  [self.heading_vector(p) for p in self.points])
+            self._labels = label_rects(self._glyphs, QFontMetrics(self._label_font),
+                                      QRectF(self.viewport().rect()))
+            self._layout_key = key
+
+    def _label_visible(self, point):
+        return self.show_labels or point.uid in self.selected_uids or point.uid == self.selected_uid
 
     def drawForeground(self, painter, rect):
         painter.save()
         painter.resetTransform()
-        painter.setFont(QFont("Segoe UI", 9))
-        positions = [self.screen(p.x, p.y) for p in self.points]
-        viewport = QRectF(self.viewport().rect()).adjusted(-60, -60, 60, 60)
-        occupied_labels = []
-        for point, position in zip(self.points, positions):
-            if point.uid == self.selected_uid:
-                text = f"{self.points.index(point) + 1} · {point.name}"
-                width = painter.fontMetrics().boundingRect(text).width() + 12
-                occupied_labels.append(QRectF(position.x() + 11, position.y() + 8, width, 21))
+        painter.setFont(self._label_font)
+        self._ensure_layout()
+        positions = [item.position for item in self._glyphs]
+        viewport = QRectF(self.viewport().rect()).adjusted(-120, -120, 120, 120)
+        if self.show_squares:
+            key = (self.square_size, tuple((p.x, p.y, p.angle, p.kind, p.side) for p in self.points))
+            if key != self._squares_key:
+                self._squares = measurement_squares(self.points, self.square_size)
+                self._squares_key = key
+            painter.setBrush(QColor(98, 231, 181, 16))
+            painter.setPen(QPen(QColor(98, 231, 181, 210), 1.3, Qt.PenStyle.DashLine))
+            for chamber, corners in self._squares:
+                polygon = QPolygonF([self.screen(x, y) for x, y in corners])
+                painter.drawPolygon(polygon)
         if self.show_route and len(positions) > 1:
             path = QPainterPath(positions[0])
             for position in positions[1:]:
@@ -197,49 +273,65 @@ class MapView(QGraphicsView):
                 if length > 65:
                     mid = (a + b) / 2
                     self._arrow(painter, mid - delta / length * 5, mid + delta / length * 5, "#d2e8ef", 1)
-        for index, (point, position) in enumerate(zip(self.points, positions)):
+        # Leader lines make displaced, collision-free tags unambiguous.
+        for item in self._glyphs:
+            box = self._labels.get(item.point.uid)
+            if box is not None and self._label_visible(item.point):
+                end = QPointF(max(box.left(), min(box.right(), item.position.x())),
+                              max(box.top(), min(box.bottom(), item.position.y())))
+                painter.setPen(QPen(QColor(COLORS[item.point.kind]), 1))
+                painter.drawLine(item.position, end)
+        # Route order is also paint order: larger early markers sit underneath
+        # the smaller later markers, leaving separate rings and arrow tips.
+        for item in self._glyphs:
+            point, position = item.point, item.position
             if not viewport.contains(position):
                 continue
-            selected = point.uid == self.selected_uid
+            selected = point.uid in self.selected_uids or point.uid == self.selected_uid
             color = COLORS[point.kind]
             if self.show_chambers and point.kind == "Measure":
-                for side in ("left", "right"):
-                    if point.side not in (side, "both"):
-                        continue
-                    sign = 1 if side == "right" else -1
-                    x = point.x + .2 * math.cos(point.angle) + sign * 2 * math.sin(point.angle)
-                    y = point.y + .2 * math.sin(point.angle) - sign * 2 * math.cos(point.angle)
-                    chamber = self.screen(x, y)
+                for item in chambers([point]):
+                    chamber = self.screen(item.x, item.y)
                     painter.setPen(QPen(QColor(color), 1))
                     painter.setBrush(QColor(98, 231, 181, 110))
                     painter.drawRect(QRectF(chamber.x() - 3, chamber.y() - 3, 6, 6))
             if selected:
                 painter.setPen(QPen(QColor("#ffffff"), 2))
                 painter.setBrush(QColor(255, 255, 255, 35))
-                painter.drawEllipse(position, 13, 13)
+                painter.drawEllipse(position, item.radius + 4, item.radius + 4)
             if self.show_headings or selected:
-                self._arrow(painter, position, position + self.heading_vector(point) * 26, color)
+                self._arrow(painter, position, item.arrow_end, color, item.arrow_width, item.head_size)
             painter.setPen(QPen(QColor("#0a1720"), 2))
             painter.setBrush(QColor(color))
-            painter.drawEllipse(position, 6.5, 6.5)
-            if self.show_labels or selected:
-                label = f"{index + 1} · {point.name}"
-                label_rect = painter.fontMetrics().boundingRect(label)
-                box = QRectF(position.x() + 11, position.y() + 8, label_rect.width() + 12, 21)
-                if selected or not any(box.intersects(other) for other in occupied_labels):
-                    occupied_labels.append(box)
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(QColor(12, 23, 30, 215))
-                    painter.drawRoundedRect(box, 4, 4)
-                    painter.setPen(QColor("#ffffff" if selected else "#e3ebed"))
-                    painter.drawText(box, Qt.AlignmentFlag.AlignCenter, label)
-            if selected:
-                handle = self.handle(point)
-                painter.setPen(QPen(QColor("#ffffff"), 1.5, Qt.PenStyle.DashLine))
-                painter.drawLine(position, handle)
-                painter.setBrush(QColor("#182a33"))
-                painter.setPen(QPen(QColor("#ffffff"), 2))
-                painter.drawEllipse(handle, 5, 5)
+            painter.drawEllipse(position, item.radius, item.radius)
+        for item in self._glyphs:
+            point = item.point
+            box = self._labels.get(point.uid)
+            if box is None or not self._label_visible(point):
+                continue
+            selected = point.uid in self.selected_uids or point.uid == self.selected_uid
+            painter.setPen(QPen(QColor("#ffffff" if selected else COLORS[point.kind]), 1))
+            painter.setBrush(QColor(12, 23, 30, 235))
+            painter.drawRoundedRect(box, 4, 4)
+            painter.setPen(QColor("#ffffff" if selected else "#e3ebed"))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, f"{item.index + 1} · {point.name}")
+        primary = next((p for p in self.points if p.uid == self.selected_uid), None)
+        if primary and self.can_rotate():
+            pivot = self.rotation_point(primary)
+            origin, handle = self.screen(pivot.x, pivot.y), self.handle(primary)
+            painter.setPen(QPen(QColor("#ffffff"), 1.5, Qt.PenStyle.DashLine))
+            painter.drawLine(origin, handle)
+            painter.setBrush(QColor("#182a33"))
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.drawEllipse(handle, 5, 5)
+            if len(self.selected_points()) > 1:
+                painter.drawLine(origin - QPointF(5, 0), origin + QPointF(5, 0))
+                painter.drawLine(origin - QPointF(0, 5), origin + QPointF(0, 5))
+        if self._rubber:
+            start, end, _ = self._rubber
+            painter.setPen(QPen(QColor("#62e7b5"), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(98, 231, 181, 35))
+            painter.drawRect(QRectF(start, end).normalized())
         painter.setPen(QColor("#eff8ff"))
         painter.setBrush(QColor(12, 23, 30, 215))
         painter.drawRoundedRect(QRectF(14, 14, 172, 29), 5, 5)
@@ -277,13 +369,35 @@ class MapView(QGraphicsView):
         except (ValueError, RuntimeError):
             pass
 
+    def _hit_label(self, pos):
+        self._ensure_layout()
+        return next((item.point for item in self._glyphs
+                     if self._label_visible(item.point) and item.point.uid in self._labels
+                     and self._labels[item.point.uid].contains(pos)), None)
+
     def _hit(self, pos):
-        hits = [(math.hypot((self.screen(p.x, p.y) - pos).x(), (self.screen(p.x, p.y) - pos).y()), p)
-                for p in self.points]
-        if not hits:
-            return None
-        distance, point = min(hits, key=lambda item: item[0])
-        return point if distance <= 12 else None
+        label = self._hit_label(pos)
+        if label:
+            return label
+        # Match the visible topmost shape, including exposed outer rings and
+        # arrowheads, rather than only measuring distance to a shared centre.
+        for item in reversed(self._glyphs):
+            delta = pos - item.position
+            if math.hypot(delta.x(), delta.y()) <= item.radius + 1:
+                return item.point
+            point = item.point
+            if self.show_headings or point.uid in self.selected_uids or point.uid == self.selected_uid:
+                if segment_distance(pos, item.position, item.arrow_end) <= item.arrow_width / 2 + 1.5:
+                    return point
+                direction = item.arrow_end - item.position
+                direction /= math.hypot(direction.x(), direction.y())
+                normal = QPointF(-direction.y(), direction.x())
+                head = QPolygonF([item.arrow_end,
+                                  item.arrow_end - direction * item.head_size + normal * item.head_size / 2,
+                                  item.arrow_end - direction * item.head_size - normal * item.head_size / 2])
+                if head.containsPoint(pos, Qt.FillRule.OddEvenFill):
+                    return point
+        return None
 
     def mousePressEvent(self, event):
         self.setFocus()
@@ -298,19 +412,41 @@ class MapView(QGraphicsView):
                 self.add_requested.emit(x, y)
                 return
             selected = next((p for p in self.points if p.uid == self.selected_uid), None)
-            handle_hit = selected and math.hypot((self.handle(selected) - pos).x(), (self.handle(selected) - pos).y()) < 10
-            point = selected if handle_hit else self._hit(pos)
+            label = self._hit_label(pos)
+            handle_hit = selected and self.can_rotate() and math.hypot((self.handle(selected) - pos).x(), (self.handle(selected) - pos).y()) < 10
+            point = label or (selected if handle_hit else self._hit(pos))
             if point:
-                self.selected.emit(point.uid)
+                modifiers = event.modifiers()
+                if modifiers & Qt.KeyboardModifier.ControlModifier:
+                    self.selection_requested.emit(point.uid, "toggle")
+                    return
+                if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                    self.selection_requested.emit(point.uid, "range")
+                    return
+                self.selection_requested.emit(point.uid, "replace" if label else "preserve")
+                if label:
+                    return
+                if self.edit_mode == "select":
+                    return
+                if self.edit_mode == "rotate" and not self.can_rotate():
+                    return
                 self.gesture_started.emit(point.uid)
                 scene = self.mapToScene(pos.toPoint())
                 original = QPointF(*self.projection.scene(point.x, point.y))
-                self._gesture = ("rotate" if handle_hit or self.edit_mode == "rotate" else "move",
-                                 point.uid, scene - original)
-                self.setCursor(Qt.CursorShape.CrossCursor if self._gesture[0] == "rotate" else Qt.CursorShape.SizeAllCursor)
+                pivot = self.rotation_point(point)
+                x, y = self.projection.coordinates(scene.x(), scene.y())
+                self._gesture = {"mode": "rotate" if handle_hit or self.edit_mode == "rotate" else "move",
+                                 "uid": point.uid, "offset": scene - original, "pivot": (pivot.x, pivot.y),
+                                 "heading": point.angle, "start_angle": math.atan2(y - pivot.y, x - pivot.x),
+                                 "relative_rotation": len(self.selected_points()) > 1 and not handle_hit}
+                self.setCursor(Qt.CursorShape.CrossCursor if self._gesture["mode"] == "rotate" else Qt.CursorShape.SizeAllCursor)
             else:
-                self._pan = pos.toPoint()
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                if self.edit_mode == "select" or event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self._rubber = (pos, pos, bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier))
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                else:
+                    self._pan = pos.toPoint()
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
         event.accept()
 
     def mouseMoveEvent(self, event):
@@ -319,30 +455,45 @@ class MapView(QGraphicsView):
             x, y = self.projection.coordinates(scene.x(), scene.y())
             self.cursor_coordinates.emit(x, y)
             if self._gesture:
-                mode, uid, offset = self._gesture
+                mode, uid, offset = (self._gesture[key] for key in ("mode", "uid", "offset"))
                 if mode == "move":
                     location = scene - offset
                     x, y = self.projection.coordinates(location.x(), location.y())
                     self.moved.emit(uid, x, y)
                 else:
-                    point = next(p for p in self.points if p.uid == uid)
-                    if math.hypot(x - point.x, y - point.y) > .01:
-                        self.rotated.emit(uid, math.atan2(y - point.y, x - point.x))
+                    cx, cy = self._gesture["pivot"]
+                    if math.hypot(x - cx, y - cy) > .01:
+                        angle = math.atan2(y - cy, x - cx)
+                        if self._gesture["relative_rotation"]:
+                            delta = angle - self._gesture["start_angle"]
+                            angle = self._gesture["heading"] + math.atan2(math.sin(delta), math.cos(delta))
+                        self.rotated.emit(uid, angle)
+            elif self._rubber:
+                self._rubber = (self._rubber[0], event.position(), self._rubber[2])
+                self.viewport().update()
             elif self._pan is not None:
                 delta = self.mapToScene(self._pan) - scene
                 self.centerOn(self.mapToScene(self.viewport().rect().center()) + delta)
                 self._pan = event.position().toPoint()
             else:
                 selected = next((p for p in self.points if p.uid == self.selected_uid), None)
-                handle_hit = selected and math.hypot((self.handle(selected) - event.position()).x(),
+                handle_hit = selected and self.can_rotate() and math.hypot((self.handle(selected) - event.position()).x(),
                                                      (self.handle(selected) - event.position()).y()) < 10
                 self.setCursor(Qt.CursorShape.CrossCursor if self.add_mode or handle_hit else
+                               Qt.CursorShape.PointingHandCursor if self._hit_label(event.position()) else
                                Qt.CursorShape.SizeAllCursor if self._hit(event.position()) else Qt.CursorShape.OpenHandCursor)
         except (ValueError, RuntimeError):
             pass
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        if self._rubber:
+            start, end, additive = self._rubber
+            rect = QRectF(start, end).normalized()
+            uids = [p.uid for p in self.points if rect.contains(self.screen(p.x, p.y))]
+            self._rubber = None
+            self.box_selected.emit(uids, additive)
+            self.viewport().update()
         if self._gesture:
             self._gesture = None
             self.gesture_finished.emit()
@@ -358,9 +509,12 @@ class MapView(QGraphicsView):
         event.accept()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self._gesture:
-            self._gesture = None
-            self.gesture_cancelled.emit()
+        if event.key() == Qt.Key.Key_Escape:
+            if self._gesture:
+                self._gesture = None
+                self.gesture_cancelled.emit()
+            self._rubber = None
+            self.viewport().update()
             event.accept()
         else:
             super().keyPressEvent(event)

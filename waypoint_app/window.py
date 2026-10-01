@@ -5,7 +5,7 @@ import math
 from collections import Counter
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, Qt, QTimer
+from PySide6.QtCore import QItemSelectionModel, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from .geo import Projection, TileSet
 from .map_view import COLORS, MapView
 from .model import Document, SIDES, TYPES, Waypoint
+from .geometry import autorotate, centre, snap_chambers, snap_positions, transform
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -69,6 +70,7 @@ class MainWindow(QMainWindow):
         self.doc = Document()
         self.projection = Projection(crs)
         self.selected_uid = None
+        self.selected_uids = set()
         self._gesture_before = None
         self._updating = False
         self._editor_values = {}
@@ -130,10 +132,12 @@ class MainWindow(QMainWindow):
         self.escape_action = self.action("Cancel placement", self.cancel_mode, QKeySequence("Escape"))
         self.move_action = self.action("Move", lambda: self.set_edit_mode("move"), checkable=True)
         self.rotate_action = self.action("Rotate", lambda: self.set_edit_mode("rotate"), checkable=True)
+        self.select_action = self.action("Select", lambda: self.set_edit_mode("select"), checkable=True)
         self.edit_group = QActionGroup(self)
         self.edit_group.setExclusive(True)
         self.edit_group.addAction(self.move_action)
         self.edit_group.addAction(self.rotate_action)
+        self.edit_group.addAction(self.select_action)
         self.move_action.setChecked(True)
 
     def _layout(self):
@@ -151,6 +155,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.move_action)
         toolbar.addAction(self.rotate_action)
+        toolbar.addAction(self.select_action)
         toolbar.addSeparator()
         toolbar.addAction(self.fit_action)
         toolbar.addAction(self.focus_action)
@@ -187,9 +192,10 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(["#", "Waypoint", "Type"])
         self.table.verticalHeader().hide()
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.setMinimumHeight(180)
         self.table.setShowGrid(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -201,8 +207,14 @@ class MainWindow(QMainWindow):
         table_delete.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         table_delete.triggered.connect(self.delete_selected)
         self.table.addAction(table_delete)
+        for widget in (self.map, self.table):
+            select_all = QAction(widget)
+            select_all.setShortcut(QKeySequence.StandardKey.SelectAll)
+            select_all.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            select_all.triggered.connect(self.select_all)
+            widget.addAction(select_all)
         layout.addWidget(self.table, 1)
-        layout.addWidget(muted("List order is the robot’s driving order. Double-click a row to focus it on the map."))
+        layout.addWidget(muted("Ctrl-click: multiple points · Shift-click: range. Shift-drag the map or use Select to box-select. Double-click to focus."))
 
         add = QGroupBox("Add a waypoint")
         add_layout = QVBoxLayout(add)
@@ -229,7 +241,12 @@ class MainWindow(QMainWindow):
         add_layout.addWidget(self.midpoint_button)
         add_layout.addWidget(muted("New points inherit the selected Z and heading. Following names of the same type are renumbered automatically."))
         layout.addWidget(add)
-        splitter.addWidget(left)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(280)
+        left_scroll.setMaximumWidth(450)
+        left_scroll.setWidget(left)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(self.map)
 
         scroll = QScrollArea()
@@ -239,13 +256,44 @@ class MainWindow(QMainWindow):
         right = QWidget()
         scroll.setWidget(right)
         detail = QVBoxLayout(right)
-        detail.setContentsMargins(16, 15, 16, 12)
+        detail.setContentsMargins(12, 15, 12, 12)
         title = QLabel("Waypoint inspector")
         title.setObjectName("title")
         detail.addWidget(title)
         self.selection_label = muted("Select a waypoint on the map or in the route list.")
         self.selection_label.setTextFormat(Qt.TextFormat.PlainText)
         detail.addWidget(self.selection_label)
+        self.auto_rotation = QCheckBox("Autorotation from path")
+        self.auto_rotation.setToolTip("Align selected headings now and during edits. DriveThrough: previous → current. Measure/TurningPoint: current → next. Stop headings remain manual.")
+        self.auto_rotation.toggled.connect(self.autorotation_toggled)
+        detail.addWidget(self.auto_rotation)
+        align_button = QPushButton("Align selected headings now")
+        align_button.clicked.connect(self.align_selected)
+        detail.addWidget(align_button)
+
+        self.group_fields = QGroupBox("Transform selection")
+        group_layout = QVBoxLayout(self.group_fields)
+        group_form = QFormLayout()
+        group_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.group_numeric = {}
+        for key, label, step in (("dx", "Move X (m)", .1), ("dy", "Move Y (m)", .1), ("angle", "Rotate by (°)", 1)):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setRange(-100000, 100000)
+            spin.setSingleStep(step)
+            self.group_numeric[key] = spin
+            group_form.addRow(label, spin)
+        group_layout.addLayout(group_form)
+        self.rotate_positions = QCheckBox("Rotate positions too")
+        self.rotate_positions.setToolTip("Rotate waypoint positions around the group centre as well as their headings.")
+        self.rotate_positions.setChecked(True)
+        self.rotate_positions.toggled.connect(self.rotation_options_changed)
+        group_layout.addWidget(self.rotate_positions)
+        apply_group = QPushButton("Apply group transform")
+        apply_group.clicked.connect(self.apply_group_transform)
+        group_layout.addWidget(apply_group)
+        group_layout.addWidget(muted("Drag any selected point to move the group. Rotate with the group’s white handle. Uncheck above to rotate headings only."))
+        detail.addWidget(self.group_fields)
         self.fields_group = QGroupBox("Properties")
         fields = QFormLayout(self.fields_group)
         fields.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -290,16 +338,64 @@ class MainWindow(QMainWindow):
         buttons.addWidget(focus)
         buttons.addWidget(self.delete_button)
         detail.addLayout(buttons)
+
+        snapping = QGroupBox("Snap selected waypoints")
+        snap_layout = QVBoxLayout(snapping)
+        snap_form = QFormLayout()
+        snap_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.snap_distance = QDoubleSpinBox()
+        self.snap_distance.setRange(.001, 1000)
+        self.snap_distance.setDecimals(3)
+        self.snap_distance.setValue(1.5)
+        self.snap_distance.setSuffix(" m")
+        snap_form.addRow("Max distance", self.snap_distance)
+        self.snap_scope = QComboBox()
+        self.snap_scope.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.snap_scope.setMinimumContentsLength(12)
+        self.snap_scope.addItems(["Nearby groups only", "All selected to one average"])
+        snap_form.addRow("Waypoint snap", self.snap_scope)
+        self.chamber_pairing = QComboBox()
+        self.chamber_pairing.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.chamber_pairing.setMinimumContentsLength(12)
+        self.chamber_pairing.addItems(["Closest active chambers", "Left chambers", "Right chambers", "Left ↔ right chambers"])
+        snap_form.addRow("Chamber pairs", self.chamber_pairing)
+        snap_layout.addLayout(snap_form)
+        self.snap_points_button = QPushButton("Snap waypoint positions")
+        self.snap_points_button.clicked.connect(self.snap_selected_positions)
+        snap_layout.addWidget(self.snap_points_button)
+        self.snap_chambers_button = QPushButton("Snap chamber pairs")
+        self.snap_chambers_button.setToolTip("Move and rotate matched measurement waypoints to align their chamber bars at an average centre and orientation.")
+        self.snap_chambers_button.clicked.connect(self.snap_selected_chambers)
+        snap_layout.addWidget(self.snap_chambers_button)
+        snap_layout.addWidget(muted("Chamber snapping moves and rotates each matched pair. With both sides active, all four chambers align at two shared positions. Left/right matches keep opposite driving directions."))
+        detail.addWidget(snapping)
         display = QGroupBox("Map layers")
         layer_layout = QVBoxLayout(display)
         for text, attribute, default in (("Route and travel direction", "show_route", True),
                                           ("Waypoint names", "show_labels", True),
                                           ("Heading arrows", "show_headings", True),
-                                          ("Measurement chamber positions", "show_chambers", False)):
+                                          ("Measurement squares", "show_squares", False),
+                                          ("Measurement chambers", "show_chambers", False)):
             checkbox = QCheckBox(text)
             checkbox.setChecked(default)
             checkbox.toggled.connect(lambda value, attr=attribute: self.layer_changed(attr, value))
             layer_layout.addWidget(checkbox)
+            if attribute == "show_squares":
+                self.squares_checkbox = checkbox
+            if attribute == "show_chambers":
+                self.chambers_checkbox = checkbox
+        self.fixed_squares = QCheckBox("Use a fixed square size")
+        self.square_size = QDoubleSpinBox()
+        self.square_size.setRange(.01, 100)
+        self.square_size.setDecimals(2)
+        self.square_size.setValue(2)
+        self.square_size.setSuffix(" m")
+        self.fixed_squares.toggled.connect(self.square_size_changed)
+        self.square_size.valueChanged.connect(self.square_size_changed)
+        self.square_size.setEnabled(False)
+        layer_layout.addWidget(self.fixed_squares)
+        layer_layout.addWidget(self.square_size)
+        layer_layout.addWidget(muted("Squares surround active measurement chambers, aligned to the field. Automatic size uses the nearest distinct chamber, as in the original reviewer."))
         layer_layout.addWidget(muted("Chambers use the original script’s geometry: 0.2 m ahead and 2 m to either side."))
         detail.addWidget(display)
         settings = QGroupBox("Map setup")
@@ -349,6 +445,8 @@ class MainWindow(QMainWindow):
 
     def _connect_map(self):
         self.map.selected.connect(self.select)
+        self.map.selection_requested.connect(self.map_selection)
+        self.map.box_selected.connect(self.box_selection)
         self.map.add_requested.connect(self.add_at)
         self.map.gesture_started.connect(self.begin_gesture)
         self.map.moved.connect(self.preview_move)
@@ -361,12 +459,33 @@ class MainWindow(QMainWindow):
         index = self.doc.index(self.selected_uid)
         return self.doc.points[index] if index is not None else None
 
+    def selected_points(self):
+        return [p for p in self.doc.points if p.uid in self.selected_uids]
+
+    def sync_selection(self):
+        self.map.selected_uid = self.selected_uid
+        self.map.selected_uids = self.selected_uids.copy()
+        self.map.allow_heading_edit = not self.auto_rotation.isChecked()
+        self.map.allow_group_rotation = self.rotate_positions.isChecked()
+        self.delete_action.setEnabled(bool(self.selected_uids))
+        self.delete_button.setEnabled(bool(self.selected_uids))
+        self.focus_action.setEnabled(bool(self.selected_uids))
+        rotation_enabled = not self.auto_rotation.isChecked() or (len(self.selected_uids) > 1 and self.rotate_positions.isChecked())
+        self.rotate_action.setEnabled(rotation_enabled)
+        self.group_numeric["angle"].setEnabled(rotation_enabled)
+        if not self.rotate_action.isEnabled() and self.rotate_action.isChecked():
+            self.move_action.setChecked(True)
+            self.map.edit_mode = "move"
+        self.snap_points_button.setEnabled(len(self.selected_uids) > 1)
+        self.snap_chambers_button.setEnabled(sum(p.kind == "Measure" and p.side != "none" for p in self.selected_points()) > 1)
+
     def refresh(self):
         self._updating = True
-        if self.doc.index(self.selected_uid) is None:
-            self.selected_uid = self.doc.points[0].uid if self.doc.points else None
+        self.selected_uids.intersection_update(p.uid for p in self.doc.points)
+        if self.selected_uid not in self.selected_uids:
+            self.selected_uid = next((p.uid for p in self.doc.points if p.uid in self.selected_uids), None)
         self.map.points = self.doc.points
-        self.map.selected_uid = self.selected_uid
+        self.sync_selection()
         path = self.doc.saved_path or self.doc.source
         self.file_label.setText(path.name if path else "New route")
         self.file_label.setToolTip(str(path) if path else "")
@@ -406,16 +525,24 @@ class MainWindow(QMainWindow):
                 if col == 2:
                     item.setForeground(QColor(COLORS[point.kind]))
                 self.table.setItem(row, col, item)
+            if point.uid in self.selected_uids:
+                self.table.selectionModel().select(self.table.model().index(row, 0),
+                                                  QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
             if point.uid == self.selected_uid:
-                self.table.selectRow(row)
+                self.table.selectionModel().setCurrentIndex(self.table.model().index(row, 0), QItemSelectionModel.SelectionFlag.NoUpdate)
         del blocker
 
     def refresh_inspector(self):
         self._updating = True
         point = self.selected_point()
-        self.fields_group.setEnabled(point is not None)
+        multiple = len(self.selected_uids) > 1
+        self.fields_group.setEnabled(point is not None and not multiple)
+        self.fields_group.setVisible(not multiple)
+        self.group_fields.setVisible(multiple)
+        self.numeric["angle"].setEnabled(not self.auto_rotation.isChecked())
         if point:
-            self.selection_label.setText(f"Route position {self.doc.index(point.uid) + 1} of {len(self.doc.points)}")
+            self.selection_label.setText(f"{len(self.selected_uids)} waypoints selected · anchor: {point.name}" if multiple else
+                                         f"Route position {self.doc.index(point.uid) + 1} of {len(self.doc.points)}")
             self.name_label.setText(point.name)
             self.type_field.setCurrentText(point.kind)
             self.side_field.setCurrentText(point.side)
@@ -427,7 +554,11 @@ class MainWindow(QMainWindow):
             coverage = ""
             if self.map.tiles and not self.map.tiles.covers(*self.projection.scene(point.x, point.y)):
                 coverage = "\nOutside downloaded imagery"
-            self.gps_label.setText(f"Latitude {lat:.8f}°\nLongitude {lon:.8f}°{coverage}")
+            if multiple:
+                cx, cy = centre(self.selected_points())
+                self.gps_label.setText(f"Group centre X {cx:.3f} m\nGroup centre Y {cy:.3f} m")
+            else:
+                self.gps_label.setText(f"Latitude {lat:.8f}°\nLongitude {lon:.8f}°{coverage}")
         else:
             self.selection_label.setText("Select a waypoint or add one to the route.")
             self.name_label.setText("—")
@@ -438,42 +569,145 @@ class MainWindow(QMainWindow):
     def select(self, uid):
         if self._updating:
             return
-        self.selected_uid = uid
-        self.map.selected_uid = uid
-        blocker = QSignalBlocker(self.table)
-        self.table.clearSelection()
-        for row in range(self.table.rowCount()):
-            if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) == uid:
-                self.table.selectRow(row)
-                self.table.scrollToItem(self.table.item(row, 0))
-                break
-        del blocker
+        self.set_selection({uid}, uid)
+
+    def set_selection(self, uids, primary=None, update_table=True):
+        valid = {p.uid for p in self.doc.points}
+        self.selected_uids = set(uids) & valid
+        self.selected_uid = primary if primary in self.selected_uids else next((p.uid for p in self.doc.points if p.uid in self.selected_uids), None)
+        self.sync_selection()
+        if update_table:
+            self.refresh_table()
         self.refresh_inspector()
-        self.delete_action.setEnabled(True)
-        self.delete_button.setEnabled(True)
-        self.focus_action.setEnabled(True)
         self.map.viewport().update()
+
+    def map_selection(self, uid, mode):
+        if mode == "toggle":
+            self.set_selection(self.selected_uids ^ {uid}, uid)
+        elif mode == "range" and self.selected_uid:
+            a, b = self.doc.index(self.selected_uid), self.doc.index(uid)
+            self.set_selection(self.selected_uids | {p.uid for p in self.doc.points[min(a, b):max(a, b) + 1]}, uid)
+        elif mode == "preserve" and uid in self.selected_uids:
+            self.set_selection(self.selected_uids, uid)
+        else:
+            self.select(uid)
+
+    def box_selection(self, uids, additive):
+        self.set_selection(self.selected_uids | set(uids) if additive else uids)
+
+    def select_all(self):
+        self.set_selection({p.uid for p in self.doc.points}, self.selected_uid)
 
     def table_selected(self):
         items = self.table.selectedItems()
-        if items:
-            self.select(items[0].data(Qt.ItemDataRole.UserRole))
+        uids = {item.data(Qt.ItemDataRole.UserRole) for item in items}
+        current = self.table.currentItem()
+        primary = current.data(Qt.ItemDataRole.UserRole) if current else self.selected_uid
+        self.set_selection(uids, primary, update_table=False)
 
     def focus_selected(self):
-        if point := self.selected_point():
-            self.map.focus_waypoint(point)
+        self.map.fit_selection()
 
     def layer_changed(self, attr, value):
         setattr(self.map, attr, value)
         self.map.viewport().update()
 
+    def square_size_changed(self, *_):
+        fixed = self.fixed_squares.isChecked()
+        self.square_size.setEnabled(fixed)
+        self.map.square_size = self.square_size.value() if fixed else None
+        self.map.viewport().update()
+
+    def rotation_options_changed(self, *_):
+        # Autorotation permits rotating the path geometry, while headings-only
+        # controls are manual and cannot override the enabled path rule.
+        self.sync_selection()
+        self.map.viewport().update()
+
+    def edit_selection(self, label, operation, follow_path=True):
+        before = self.doc.snapshot()
+        try:
+            result = operation()
+            if follow_path and self.auto_rotation.isChecked():
+                autorotate(self.doc.points, self.selected_uids)
+            for point in self.selected_points():
+                point.validate()
+                self.projection.scene(point.x, point.y)
+        except (ValueError, RuntimeError) as error:
+            self.doc.points = before
+            self.error("Cannot edit selection", error)
+            self.refresh()
+            return None
+        self.doc.record(label, before)
+        self.refresh()
+        return result
+
+    def autorotation_toggled(self, checked):
+        self.sync_selection()
+        if checked:
+            self.align_selected()
+        else:
+            self.refresh_inspector()
+            self.map.viewport().update()
+
+    def align_selected(self, *_):
+        if not self.selected_uids:
+            self.statusBar().showMessage("Select waypoints to align their headings.", 6000)
+            return
+        count = self.edit_selection("align headings to path", lambda: autorotate(self.doc.points, self.selected_uids), follow_path=False)
+        if count is not None:
+            self.statusBar().showMessage(f"Updated {count} headings using route travel direction. Stop headings are preserved.", 7000)
+
+    def apply_group_transform(self):
+        if len(self.selected_uids) < 2:
+            return
+        dx, dy = self.group_numeric["dx"].value(), self.group_numeric["dy"].value()
+        angle = math.radians(self.group_numeric["angle"].value())
+        if self.auto_rotation.isChecked() and not self.rotate_positions.isChecked():
+            angle = 0.
+        def operation():
+            if self.rotate_positions.isChecked():
+                transform(self.doc.points, self.selected_uids, dx=dx, dy=dy, angle=angle)
+            else:
+                for point in self.selected_points():
+                    point.x += dx
+                    point.y += dy
+                    point.angle += angle
+        self.edit_selection("transform selection", operation)
+        for spin in self.group_numeric.values():
+            spin.setValue(0)
+
+    def snap_selected_positions(self):
+        if len(self.selected_uids) < 2:
+            return
+        distance = self.snap_distance.value() if self.snap_scope.currentIndex() == 0 else None
+        count = self.edit_selection("snap waypoint positions", lambda: snap_positions(self.doc.points, self.selected_uids, distance))
+        if count is not None:
+            self.statusBar().showMessage(f"Snapped {count} waypoint positions to their group averages. Route rows remain separate." if count else
+                                         "No selected waypoint pairs within the snap distance. Increase the distance or choose All selected.", 10000)
+
+    def snap_selected_chambers(self):
+        if len(self.selected_uids) < 2:
+            return
+        side = ("closest", "left", "right", "opposite")[self.chamber_pairing.currentIndex()]
+        matches = self.edit_selection("snap measurement chambers",
+                                      lambda: snap_chambers(self.doc.points, self.selected_uids, self.snap_distance.value(), side),
+                                      follow_path=False)
+        if matches is not None:
+            self.map.show_chambers = True
+            self.chambers_checkbox.setChecked(True)
+            self.statusBar().showMessage(f"Moved and rotated {len(matches)} measurement waypoint pairs to align their active chambers." if matches else
+                                         "No eligible chamber pairs within the snap distance. Select measurement waypoints and check their active sides.", 11000)
+
     def apply_fields(self, *_):
-        if self._updating or not (point := self.selected_point()):
+        if self._updating or len(self.selected_uids) != 1 or not (point := self.selected_point()):
+            return
+        changed = {key: spin.value() for key, spin in self.numeric.items()
+                   if spin.value() != self._editor_values.get(key)}
+        if not changed and self.type_field.currentText() == point.kind and self.side_field.currentText() == point.side:
             return
         before = self.doc.snapshot()
         try:
-            changed = {key: spin.value() for key, spin in self.numeric.items()
-                       if spin.value() != self._editor_values.get(key)}
             x, y = changed.get("x", point.x), changed.get("y", point.y)
             self.projection.scene(x, y)
             self.doc.change_type(self.doc.index(point.uid), self.type_field.currentText())
@@ -481,6 +715,8 @@ class MainWindow(QMainWindow):
             for key, value in changed.items():
                 setattr(point, key, math.radians(value) if key == "angle" else value)
             point.validate()
+            if self.auto_rotation.isChecked():
+                autorotate(self.doc.points, self.selected_uids)
         except (ValueError, RuntimeError) as error:
             self.doc.points = before
             self.error("Cannot edit waypoint", error)
@@ -492,13 +728,28 @@ class MainWindow(QMainWindow):
         self._gesture_before = self.doc.snapshot()
 
     def preview_move(self, uid, x, y):
-        point = self.doc.points[self.doc.index(uid)]
-        point.x, point.y = x, y
+        if self._gesture_before is None:
+            return
+        point = next(p for p in self._gesture_before if p.uid == uid)
+        transform(self.doc.points, self.selected_uids, dx=x - point.x, dy=y - point.y, baseline=self._gesture_before)
+        if self.auto_rotation.isChecked():
+            autorotate(self.doc.points, self.selected_uids)
         self.refresh_inspector()
         self.map.viewport().update()
 
     def preview_rotation(self, uid, angle):
-        self.doc.points[self.doc.index(uid)].angle = angle
+        if self._gesture_before is None:
+            return
+        primary = next(p for p in self._gesture_before if p.uid == uid)
+        delta = angle - primary.angle
+        if self.rotate_positions.isChecked():
+            transform(self.doc.points, self.selected_uids, angle=delta, baseline=self._gesture_before)
+        else:
+            by_id = {p.uid: p for p in self._gesture_before}
+            for point in self.selected_points():
+                point.angle = by_id[point.uid].angle + delta
+        if self.auto_rotation.isChecked():
+            autorotate(self.doc.points, self.selected_uids)
         self.refresh_inspector()
         self.map.viewport().update()
 
@@ -517,7 +768,9 @@ class MainWindow(QMainWindow):
     def set_edit_mode(self, mode):
         self.add_button.setChecked(False)
         self.map.edit_mode = mode
-        self.statusBar().showMessage("Drag a waypoint to move it." if mode == "move" else "Drag from a waypoint toward the desired heading.")
+        self.statusBar().showMessage({"move": "Drag any selected waypoint to move the selection.",
+                                     "rotate": "Drag to rotate the selection around its centre.",
+                                     "select": "Drag a box to select waypoints. Ctrl-click toggles; Shift-click selects a route range."}[mode])
 
     def toggle_add(self, enabled):
         if enabled and self.placement.currentIndex() != 0 and self.selected_point() is None:
@@ -534,6 +787,8 @@ class MainWindow(QMainWindow):
         if self.map._gesture:
             self.map._gesture = None
             self.cancel_gesture()
+        self.map._rubber = None
+        self.map.viewport().update()
         self.add_button.setChecked(False)
 
     def insertion_index(self):
@@ -555,11 +810,14 @@ class MainWindow(QMainWindow):
                              self.add_type.currentText(), self.add_side.currentText(), "New")
             before = self.doc.snapshot()
             self.doc.insert(index, point)
+            if self.auto_rotation.isChecked():
+                autorotate(self.doc.points, {point.uid} | self.selected_uids)
             self.doc.record("add waypoint", before)
         except (ValueError, RuntimeError) as error:
             self.error("Cannot add waypoint", error)
             return
         self.selected_uid = point.uid
+        self.selected_uids = {point.uid}
         self.add_button.setChecked(False)
         self.refresh()
         self.statusBar().showMessage(f"Added {point.name} at route position {index + 1}. Drag it or edit its properties.", 8000)
@@ -582,15 +840,17 @@ class MainWindow(QMainWindow):
         focus = self.focusWidget()
         if isinstance(focus, QLineEdit):
             return
-        index = self.doc.index(self.selected_uid)
-        if index is None:
+        indices = [index for index, point in enumerate(self.doc.points) if point.uid in self.selected_uids]
+        if not indices:
             return
         before = self.doc.snapshot()
-        removed = self.doc.delete(index)
-        self.doc.record("delete waypoint", before)
-        self.selected_uid = self.doc.points[min(index, len(self.doc.points) - 1)].uid if self.doc.points else None
+        for index in reversed(indices):
+            self.doc.delete(index)
+        self.doc.record("delete waypoints", before)
+        self.selected_uid = self.doc.points[min(indices[0], len(self.doc.points) - 1)].uid if self.doc.points else None
+        self.selected_uids = {self.selected_uid} if self.selected_uid else set()
         self.refresh()
-        self.statusBar().showMessage(f"Deleted {removed.name}. Ctrl+Z restores it.", 6000)
+        self.statusBar().showMessage(f"Deleted {len(indices)} waypoints. Ctrl+Z restores them.", 6000)
 
     def history(self, redo):
         self.cancel_mode()
@@ -598,6 +858,7 @@ class MainWindow(QMainWindow):
         self.doc.redo() if redo else self.doc.undo()
         if self.doc.index(self.selected_uid) is None and self.doc.points and index is not None:
             self.selected_uid = self.doc.points[min(index, len(self.doc.points) - 1)].uid
+            self.selected_uids.add(self.selected_uid)
         self.refresh()
 
     def confirm_discard(self):
@@ -630,6 +891,7 @@ class MainWindow(QMainWindow):
             return
         self.cancel_mode()
         self.selected_uid = self.doc.points[0].uid
+        self.selected_uids = {self.selected_uid}
         self.search.clear()
         self.refresh()
         self.map.fit_route()
@@ -646,6 +908,7 @@ class MainWindow(QMainWindow):
         self.cancel_mode()
         self.doc = Document()
         self.selected_uid = None
+        self.selected_uids = set()
         self.search.clear()
         self.refresh()
         self.map.fit_route()
