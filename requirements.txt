@@ -1,0 +1,9 @@
+PySide6>=6.8,<7
+pyproj>=3.7,<4
+
+# Dependencies for the original analyze_coords.py review script.
+numpy
+pandas
+matplotlib
+scikit-learn
+scipy
