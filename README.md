@@ -1,7 +1,6 @@
 # Waypoint Studio
 
-A native Python / Qt editor for robot waypoint routes, with offline satellite imagery.
-The original experimental reviewer remains available in `analyze_coords.py`.
+A native Python / Qt editor for FFR-robot waypoint routes, with offline satellite imagery.
 
 ![Compact route overview on local satellite imagery](docs/overview_editor_preview.png)
 
